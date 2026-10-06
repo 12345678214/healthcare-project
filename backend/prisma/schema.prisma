@@ -1,0 +1,323 @@
+// =====================================================================
+// Healthcare Appointment Management System — Prisma Schema (PostgreSQL)
+// See /docs/database-design.md for full relationship explanations.
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------
+
+enum Role {
+  PATIENT
+  DOCTOR
+  ADMIN
+}
+
+enum AppointmentStatus {
+  PENDING     // created, awaiting doctor confirmation
+  CONFIRMED   // doctor accepted
+  COMPLETED   // visit happened
+  CANCELLED   // cancelled by patient or doctor
+  REJECTED    // doctor rejected the request
+}
+
+enum DoctorApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// ---------------------------------------------------------------------
+// USERS — base authentication table shared by every role.
+// One row per login identity. Role-specific data lives in
+// Patient / Doctor, linked 1-to-1 back to this table.
+// ---------------------------------------------------------------------
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  role         Role
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  patient      Patient?
+  doctor       Doctor?
+  notifications Notification[]
+  auditLogs    AuditLog[]
+
+  @@index([role])
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------
+// PATIENTS — 1-to-1 with User. Holds patient-only profile fields.
+// ---------------------------------------------------------------------
+model Patient {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  fullName  String
+  phone     String?
+  dob       DateTime?
+  gender    String?
+  address   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  appointments Appointment[]
+  medicalRecords MedicalRecord[]
+
+  @@map("patients")
+}
+
+// ---------------------------------------------------------------------
+// DOCTORS — 1-to-1 with User. Holds doctor-only profile fields.
+// ---------------------------------------------------------------------
+model Doctor {
+  id                String                @id @default(uuid())
+  userId            String                @unique
+  user              User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  fullName          String
+  phone             String?
+  bio               String?
+  experienceYears   Int                   @default(0)
+  qualifications     String?
+  consultationFee   Decimal               @db.Decimal(10, 2) @default(0)
+  approvalStatus    DoctorApprovalStatus  @default(PENDING)
+
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  specializations   DoctorSpecialization[]
+  availability      DoctorAvailability[]
+  leaves            DoctorLeave[]
+  appointments      Appointment[]
+  medicalRecords    MedicalRecord[]
+
+  @@index([approvalStatus])
+  @@map("doctors")
+}
+
+// ---------------------------------------------------------------------
+// SPECIALIZATIONS — lookup table of medical departments/specialities.
+// ---------------------------------------------------------------------
+model Specialization {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+
+  doctors     DoctorSpecialization[]
+
+  @@map("specializations")
+}
+
+// ---------------------------------------------------------------------
+// DOCTOR_SPECIALIZATIONS — many-to-many join table.
+// A doctor can have several specializations; a specialization can
+// belong to many doctors.
+// ---------------------------------------------------------------------
+model DoctorSpecialization {
+  id               String         @id @default(uuid())
+  doctorId         String
+  specializationId String
+
+  doctor           Doctor         @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  specialization   Specialization @relation(fields: [specializationId], references: [id], onDelete: Cascade)
+
+  @@unique([doctorId, specializationId])
+  @@map("doctor_specializations")
+}
+
+// ---------------------------------------------------------------------
+// DOCTOR_AVAILABILITY — recurring weekly availability windows.
+// Example: Doctor X is available Monday 09:00–13:00 in 30-minute slots.
+// The booking service expands this into concrete free/booked slots
+// for a specific calendar date by subtracting existing appointments.
+// ---------------------------------------------------------------------
+model DoctorAvailability {
+  id                  String   @id @default(uuid())
+  doctorId            String
+  doctor              Doctor   @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  dayOfWeek           Int      // 0 = Sunday ... 6 = Saturday
+  startTime           String   // "09:00" (24h, stored as string for simplicity)
+  endTime             String   // "13:00"
+  slotDurationMinutes Int      @default(30)
+  isActive            Boolean  @default(true)
+
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@unique([doctorId, dayOfWeek, startTime, endTime])
+  @@index([doctorId, dayOfWeek])
+  @@map("doctor_availability")
+}
+
+// ---------------------------------------------------------------------
+// DOCTOR_LEAVE — one-off leave/holiday date ranges that override the
+// recurring weekly availability above. The booking engine checks this
+// table first: if a requested date falls inside an active leave range
+// for that doctor, no slots are offered for that date, regardless of
+// what the weekly pattern says.
+// ---------------------------------------------------------------------
+model DoctorLeave {
+  id        String   @id @default(uuid())
+  doctorId  String
+  doctor    Doctor   @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+  reason    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([doctorId, startDate, endDate])
+  @@map("doctor_leaves")
+}
+
+// ---------------------------------------------------------------------
+// APPOINTMENTS — the core transactional table.
+// The composite unique constraint on (doctorId, appointmentDate,
+// startTime) is the DATABASE-LEVEL guarantee against double booking:
+// even under concurrent requests, Postgres rejects the second insert.
+// ---------------------------------------------------------------------
+model Appointment {
+  id              String            @id @default(uuid())
+
+  patientId       String
+  patient         Patient           @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  doctorId        String
+  doctor          Doctor            @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  appointmentDate DateTime          @db.Date
+  startTime       String            // "09:30"
+  endTime         String            // "10:00"
+
+  status          AppointmentStatus @default(PENDING)
+  reasonForVisit  String?
+  notes           String?           // doctor's private consultation notes
+
+  // Reminder tracking — set once a reminder email/notification has
+  // actually been sent, so the reminder job never sends the same
+  // reminder twice even if it runs again before the appointment time.
+  reminder24hSentAt DateTime?
+  reminder1hSentAt  DateTime?
+
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  medicalRecord   MedicalRecord?
+
+  @@unique([doctorId, appointmentDate, startTime], name: "uniq_doctor_slot")
+  @@index([patientId])
+  @@index([doctorId, appointmentDate])
+  @@index([status])
+  @@map("appointments")
+}
+
+// ---------------------------------------------------------------------
+// NOTIFICATIONS — in-app notifications for any user
+// (appointment confirmed, cancelled, reminder, etc.)
+// ---------------------------------------------------------------------
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title     String
+  message   String
+  isRead    Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, isRead])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------
+// MEDICAL_RECORDS — created by a doctor after an appointment is
+// completed. One record per appointment (enforced by the unique
+// constraint on appointmentId) — a doctor documents diagnosis,
+// observations, and prescription for that specific visit.
+// ---------------------------------------------------------------------
+model MedicalRecord {
+  id            String          @id @default(uuid())
+
+  appointmentId String          @unique
+  appointment   Appointment     @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  patientId     String
+  patient       Patient         @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  doctorId      String
+  doctor        Doctor          @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  diagnosis     String?
+  symptoms      String?
+  doctorNotes   String?
+  followUpDate  DateTime?       @db.Date
+
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  prescriptionItems PrescriptionItem[]
+
+  @@index([patientId])
+  @@index([doctorId])
+  @@map("medical_records")
+}
+
+// ---------------------------------------------------------------------
+// PRESCRIPTION_ITEMS — one row per prescribed medicine on a medical
+// record, rather than a single free-text blob, so the medicine list
+// can be structured (name, dosage, instructions) and rendered as a
+// clean list in the UI.
+// ---------------------------------------------------------------------
+model PrescriptionItem {
+  id              String        @id @default(uuid())
+  medicalRecordId String
+  medicalRecord   MedicalRecord @relation(fields: [medicalRecordId], references: [id], onDelete: Cascade)
+
+  medicineName    String
+  dosage          String?       // e.g. "500mg"
+  instructions    String?       // e.g. "Twice daily after food, for 5 days"
+
+  @@index([medicalRecordId])
+  @@map("prescription_items")
+}
+
+// ---------------------------------------------------------------------
+// AUDIT_LOGS — lightweight trail of important actions for admin
+// visibility (who did what, and when).
+// ---------------------------------------------------------------------
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  action     String   // e.g. "APPOINTMENT_CREATED", "DOCTOR_APPROVED"
+  entityType String   // e.g. "Appointment", "Doctor"
+  entityId   String?
+  metadata   String?  // JSON-serialized extra context
+
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}
